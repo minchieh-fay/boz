@@ -1,0 +1,8 @@
+{
+  "symbol": "ETHUSDC",
+  "quantity": "0.1",
+  "keyfile": "/root/key",
+  "take_profit": 0.03,
+  "stop_loss": 0.02,
+  "interval_seconds": 300
+}

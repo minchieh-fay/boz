@@ -1,0 +1,13 @@
+services:
+  boz:
+    image: alpine:3.22
+    platform: linux/amd64
+    working_dir: /app
+    command: ["/app/boz", "/app/config.json"]
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ./boz:/app/boz:ro
+      - ./config.json:/app/config.json:ro
+      - /root/key:/root/key:ro
+      - /etc/ssl/certs:/etc/ssl/certs:ro
