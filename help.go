@@ -49,6 +49,8 @@ type strategyState struct {
 type positionState struct {
 	entryOrderID string
 	entryAt      time.Time
+	entryFilled  bool
+	positionSeen bool
 }
 
 // 从 JSON 配置读取并校验实时交易所需参数。
@@ -537,7 +539,13 @@ func help_processCandleDual(ctx context.Context, client *binance.Client, cfg con
 		return nil
 	}
 	// 调用方向开仓辅助函数创建目标持仓侧的唯一 GTC 挂单。
-	return help_placeEntrySide(ctx, client, cfg, state, target, entrySide, priceTick, quantity)
+	if err := help_placeEntrySide(ctx, client, cfg, state, target, entrySide,
+		priceTick, quantity); err != nil {
+		return err
+	}
+	state.longEntryID, state.longEntryAt = long.entryOrderID, long.entryAt
+	state.shortEntryID, state.shortEntryAt = short.entryOrderID, short.entryAt
+	return nil
 }
 
 // 仅维护指定持仓方向的仓位保护单和对应开仓挂单。
@@ -572,6 +580,8 @@ func help_managePositionSide(ctx context.Context, client *binance.Client, cfg co
 			state.entryOrderID = order.ClientOrderID
 			state.entryAt = time.UnixMilli(order.Time)
 		}
+		state.entryFilled = false
+		state.positionSeen = false
 	}
 	for _, order := range algos {
 		if order.PositionSide != positionSide || !strings.HasPrefix(order.ClientAlgoId, algoPrefix) {
@@ -585,6 +595,16 @@ func help_managePositionSide(ctx context.Context, client *binance.Client, cfg co
 	}
 	// step.2 给已确认持仓补保护单，或只清理该方向的空仓遗留单。
 	if amount != 0 {
+		state.positionSeen = true
+		if state.entryOrderID == "" {
+			// 调用订单历史辅助函数恢复本程序已成交开仓单的归属标识。
+			entryOrderID, entryAt, err := help_findFilledEntryOrder(ctx, client,
+				cfg.Symbol, positionSide)
+			if err != nil {
+				return err
+			}
+			state.entryOrderID, state.entryAt = entryOrderID, entryAt
+		}
 		if state.entryOrderID == "" && !hasTakeProfit && !hasStopLoss {
 			return fmt.Errorf("检测到 %s %s 仓位没有本策略订单标识，暂停自动管理",
 				cfg.Symbol, positionSide)
@@ -603,6 +623,31 @@ func help_managePositionSide(ctx context.Context, client *binance.Client, cfg co
 			return err
 		}
 		return nil
+	}
+	if state.entryOrderID != "" && !ownedEntry {
+		// 调用交易所订单查询服务确认消失的开仓单是否已经成交。
+		entryOrder, err := client.NewGetOrderService().Symbol(cfg.Symbol).
+			OrigClientOrderID(state.entryOrderID).Do(ctx)
+		if err != nil {
+			return fmt.Errorf("查询%s开仓单最终状态: %w", positionSide, err)
+		}
+		if entryOrder.Status == binance.OrderStatusTypeFilled {
+			if state.positionSeen {
+				state.entryOrderID, state.entryAt = "", time.Time{}
+				state.entryFilled, state.positionSeen = false, false
+			} else if !state.entryFilled {
+				state.entryFilled = true
+				state.entryAt = time.Now()
+			} else if time.Since(state.entryAt) < 2*time.Duration(cfg.IntervalSeconds)*time.Second {
+				return nil
+			} else {
+				state.entryOrderID, state.entryAt = "", time.Time{}
+				state.entryFilled = false
+			}
+		} else {
+			state.entryOrderID, state.entryAt = "", time.Time{}
+			state.entryFilled, state.positionSeen = false, false
+		}
 	}
 	for _, order := range algos {
 		if order.PositionSide == positionSide && strings.HasPrefix(order.ClientAlgoId, algoPrefix) {
@@ -624,11 +669,45 @@ func help_managePositionSide(ctx context.Context, client *binance.Client, cfg co
 				}
 			}
 			state.entryOrderID, state.entryAt = "", time.Time{}
+			state.entryFilled, state.positionSeen = false, false
 		}
-	} else {
-		state.entryOrderID, state.entryAt = "", time.Time{}
+	} else if state.entryOrderID == "" {
+		state.entryFilled, state.positionSeen = false, false
 	}
 	return nil
+}
+
+// 从近期成交订单中恢复指定双向仓位的本策略开仓标识。
+func help_findFilledEntryOrder(ctx context.Context, client *binance.Client,
+	symbol string, positionSide binance.PositionSideType) (string, time.Time, error) {
+	// step.1 按交易对和持仓方向筛选本策略的已成交开仓订单。
+	sideCode := "L"
+	orderSide := binance.SideTypeBuy
+	if positionSide == binance.PositionSideTypeShort {
+		sideCode, orderSide = "S", binance.SideTypeSell
+	}
+	// 调用订单前缀辅助函数限定当前方向的本策略订单命名空间。
+	entryPrefix := help_orderPrefix(symbol) + "E" + sideCode
+	orders, err := client.NewListOrdersService().Symbol(symbol).Limit(100).Do(ctx)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("查询%s历史开仓单: %w", positionSide, err)
+	}
+	// step.2 选择最近一笔符合本策略命名空间的已成交开仓单。
+	var latest *binance.Order
+	for _, order := range orders {
+		if order.PositionSide != positionSide || order.Side != orderSide ||
+			order.Status != binance.OrderStatusTypeFilled ||
+			!strings.HasPrefix(order.ClientOrderID, entryPrefix) {
+			continue
+		}
+		if latest == nil || order.Time > latest.Time {
+			latest = order
+		}
+	}
+	if latest == nil {
+		return "", time.Time{}, nil
+	}
+	return latest.ClientOrderID, time.UnixMilli(latest.Time), nil
 }
 
 // 将指定方向的 GTC 开仓单绑定到对应的双向持仓。
@@ -662,6 +741,7 @@ func help_placeEntrySide(ctx context.Context, client *binance.Client, cfg config
 			NewClientOrderID(clientID).Do(ctx)
 		if createErr == nil {
 			state.entryOrderID, state.entryAt = response.ClientOrderID, time.Now()
+			state.entryFilled, state.positionSeen = false, false
 			strategy.turns = 0
 			log.Printf("%s 开仓限价单已提交: id=%s qty=%s price=%s",
 				positionSide, response.ClientOrderID, quantity, priceText)
