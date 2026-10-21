@@ -37,8 +37,18 @@ type strategyState struct {
 	deltaReady    bool
 	side          int
 	turns         int
+	longEntryID   string
+	longEntryAt   time.Time
+	shortEntryID  string
+	shortEntryAt  time.Time
 	entryOrderID  string
 	entryAt       time.Time
+}
+
+// 保存单一持仓方向的开仓挂单标识和提交时间。
+type positionState struct {
+	entryOrderID string
+	entryAt      time.Time
 }
 
 // 从 JSON 配置读取并校验实时交易所需参数。
@@ -100,8 +110,8 @@ func help_runLive(ctx context.Context, cfg config, apiKey, secret string) error 
 	if err != nil {
 		return fmt.Errorf("读取账户持仓模式: %w", err)
 	}
-	if mode.DualSidePosition {
-		return errors.New("当前策略仅支持币安单向持仓模式，请先将账户切换为单向持仓")
+	if !mode.DualSidePosition {
+		return errors.New("当前策略需要币安双向持仓模式，请先将账户切换为双向持仓")
 	}
 	info, err := client.NewExchangeInfoService().Do(ctx)
 	if err != nil {
@@ -144,7 +154,7 @@ func help_runLive(ctx context.Context, cfg config, apiKey, secret string) error 
 				return
 			}
 			// 调用策略周期处理辅助函数更新信号并维护账户订单。
-			if runErr := help_processCandle(ctx, client, cfg, state,
+			if runErr := help_processCandleDual(ctx, client, cfg, state,
 				closePrice, priceTick, quantity); runErr != nil {
 				log.Printf("处理策略周期失败: %v", runErr)
 			}
@@ -437,6 +447,277 @@ func help_placeProtection(ctx context.Context, client *binance.Client, cfg confi
 	}
 	log.Printf("持仓保护已设置: 来源开仓单=%s take=%g stop=%g", entryOrderID,
 		takePrice, stopPrice)
+	return nil
+}
+
+// 按双向持仓模式分别协调两侧订单、持仓和 EMA 入场信号。
+func help_processCandleDual(ctx context.Context, client *binance.Client, cfg config,
+	state *strategyState, closePrice, priceTick float64, quantity string) error {
+	// step.1 查询账户交易状态并分别维护 LONG 与 SHORT。
+	positions, err := client.NewGetPositionRiskService().Symbol(cfg.Symbol).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("查询账户持仓: %w", err)
+	}
+	orders, err := client.NewListOpenOrdersService().Symbol(cfg.Symbol).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("查询普通挂单: %w", err)
+	}
+	algos, err := client.NewListOpenAlgoOrdersService().Symbol(cfg.Symbol).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("查询止盈止损条件单: %w", err)
+	}
+	// step.1.1 阻止新策略误认升级前没有方向标签的遗留订单。
+	// 调用订单前缀辅助函数按交易对确认本策略订单命名空间。
+	orderRoot := help_orderPrefix(cfg.Symbol)
+	for _, order := range orders {
+		if strings.HasPrefix(order.ClientOrderID, orderRoot+"E") &&
+			!strings.HasPrefix(order.ClientOrderID, orderRoot+"EL") &&
+			!strings.HasPrefix(order.ClientOrderID, orderRoot+"ES") {
+			return fmt.Errorf("发现升级前遗留开仓单 %s，请先在 Binance 撤销后重启", order.ClientOrderID)
+		}
+	}
+	for _, order := range algos {
+		if strings.HasPrefix(order.ClientAlgoId, orderRoot+"X") &&
+			!strings.HasPrefix(order.ClientAlgoId, orderRoot+"XL") &&
+			!strings.HasPrefix(order.ClientAlgoId, orderRoot+"XS") {
+			return fmt.Errorf("发现升级前遗留条件单 %s，请先在 Binance 撤销后重启", order.ClientAlgoId)
+		}
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	long := &positionState{entryOrderID: state.longEntryID, entryAt: state.longEntryAt}
+	short := &positionState{entryOrderID: state.shortEntryID, entryAt: state.shortEntryAt}
+	// 调用方向管理辅助函数维护本策略 LONG 仓位和订单。
+	if err := help_managePositionSide(ctx, client, cfg, positions, orders,
+		algos, binance.PositionSideTypeLong, long, priceTick); err != nil {
+		return err
+	}
+	// 调用方向管理辅助函数维护本策略 SHORT 仓位和订单。
+	if err := help_managePositionSide(ctx, client, cfg, positions, orders,
+		algos, binance.PositionSideTypeShort, short, priceTick); err != nil {
+		return err
+	}
+	state.longEntryID, state.longEntryAt = long.entryOrderID, long.entryAt
+	state.shortEntryID, state.shortEntryAt = short.entryOrderID, short.entryAt
+	// step.2 更新 EMA 入场信号，并只在目标方向没有仓位或挂单时开仓。
+	if !state.emaReady {
+		state.ema = closePrice
+		state.emaReady = true
+		return nil
+	}
+	previous := state.ema
+	state.ema = (2.0/26.0)*closePrice + (24.0/26.0)*state.ema
+	delta := state.ema - previous
+	if state.deltaReady && state.side != 0 {
+		if state.side > 0 && state.previousDelta > 0 && delta < state.previousDelta {
+			state.turns++
+		} else if state.side < 0 && state.previousDelta < 0 && delta > state.previousDelta {
+			state.turns++
+		}
+	}
+	state.previousDelta, state.deltaReady = delta, true
+	signal := 0
+	if closePrice > state.ema {
+		signal = 1
+	} else if closePrice < state.ema {
+		signal = -1
+	}
+	if signal != state.side {
+		state.side, state.turns = signal, 0
+	}
+	if signal == 0 || state.turns < 2 {
+		return nil
+	}
+	entrySide := -signal
+	target := long
+	if entrySide < 0 {
+		target = short
+	}
+	if target.entryOrderID != "" {
+		return nil
+	}
+	// 调用方向开仓辅助函数创建目标持仓侧的唯一 GTC 挂单。
+	return help_placeEntrySide(ctx, client, cfg, state, target, entrySide, priceTick, quantity)
+}
+
+// 仅维护指定持仓方向的仓位保护单和对应开仓挂单。
+func help_managePositionSide(ctx context.Context, client *binance.Client, cfg config,
+	positions []*binance.PositionRisk, orders []*binance.Order,
+	algos []binance.GetAlgoOrderResp, positionSide binance.PositionSideType,
+	state *positionState, priceTick float64) error {
+	// step.1 按 positionSide 和本策略订单 ID 前缀确认该方向交易归属。
+	// 调用订单前缀辅助函数按交易对生成本策略订单命名空间。
+	orderPrefix := help_orderPrefix(cfg.Symbol)
+	sideCode := "L"
+	if positionSide == binance.PositionSideTypeShort {
+		sideCode = "S"
+	}
+	entryPrefix := orderPrefix + "E" + sideCode
+	algoPrefix := orderPrefix + "X" + sideCode
+	var amount, entryPrice float64
+	for _, position := range positions {
+		if position.Symbol == cfg.Symbol && position.PositionSide == string(positionSide) {
+			amount, _ = strconv.ParseFloat(position.PositionAmt, 64)
+			entryPrice, _ = strconv.ParseFloat(position.EntryPrice, 64)
+			break
+		}
+	}
+	ownedEntry, hasTakeProfit, hasStopLoss := false, false, false
+	for _, order := range orders {
+		if order.PositionSide != positionSide || !strings.HasPrefix(order.ClientOrderID, entryPrefix) {
+			continue
+		}
+		ownedEntry = true
+		if state.entryOrderID != order.ClientOrderID {
+			state.entryOrderID = order.ClientOrderID
+			state.entryAt = time.UnixMilli(order.Time)
+		}
+	}
+	for _, order := range algos {
+		if order.PositionSide != positionSide || !strings.HasPrefix(order.ClientAlgoId, algoPrefix) {
+			continue
+		}
+		if order.OrderType == binance.AlgoOrderTypeTakeProfitMarket {
+			hasTakeProfit = true
+		} else if order.OrderType == binance.AlgoOrderTypeStopMarket {
+			hasStopLoss = true
+		}
+	}
+	// step.2 给已确认持仓补保护单，或只清理该方向的空仓遗留单。
+	if amount != 0 {
+		if state.entryOrderID == "" && !hasTakeProfit && !hasStopLoss {
+			return fmt.Errorf("检测到 %s %s 仓位没有本策略订单标识，暂停自动管理",
+				cfg.Symbol, positionSide)
+		}
+		for _, order := range orders {
+			if order.PositionSide == positionSide && strings.HasPrefix(order.ClientOrderID, entryPrefix) {
+				if _, err := client.NewCancelOrderService().Symbol(cfg.Symbol).
+					OrderID(order.OrderID).Do(ctx); err != nil {
+					return fmt.Errorf("撤销部分成交开仓单剩余数量: %w", err)
+				}
+			}
+		}
+		// 调用方向保护辅助函数为当前 LONG 或 SHORT 仓位补齐止盈止损。
+		if err := help_placeProtectionSide(ctx, client, cfg, state.entryOrderID,
+			positionSide, amount, entryPrice, priceTick, hasTakeProfit, hasStopLoss); err != nil {
+			return err
+		}
+		return nil
+	}
+	for _, order := range algos {
+		if order.PositionSide == positionSide && strings.HasPrefix(order.ClientAlgoId, algoPrefix) {
+			if _, err := client.NewCancelAlgoOrderService().
+				ClientAlgoID(order.ClientAlgoId).Do(ctx); err != nil {
+				return fmt.Errorf("撤销空仓后的%s保护单: %w", positionSide, err)
+			}
+		}
+	}
+	if ownedEntry {
+		if state.entryAt.IsZero() || time.Since(state.entryAt) >=
+			time.Duration(cfg.IntervalSeconds)*time.Second {
+			for _, order := range orders {
+				if order.PositionSide == positionSide && strings.HasPrefix(order.ClientOrderID, entryPrefix) {
+					if _, err := client.NewCancelOrderService().Symbol(cfg.Symbol).
+						OrderID(order.OrderID).Do(ctx); err != nil {
+						return fmt.Errorf("撤销到期的%s开仓单: %w", positionSide, err)
+					}
+				}
+			}
+			state.entryOrderID, state.entryAt = "", time.Time{}
+		}
+	} else {
+		state.entryOrderID, state.entryAt = "", time.Time{}
+	}
+	return nil
+}
+
+// 将指定方向的 GTC 开仓单绑定到对应的双向持仓。
+func help_placeEntrySide(ctx context.Context, client *binance.Client, cfg config,
+	strategy *strategyState, state *positionState, side int, priceTick float64, quantity string) error {
+	// step.1 读取盘口并按开仓方向计算逐档限价。
+	books, err := client.NewListBookTickersService().Symbol(cfg.Symbol).Do(ctx)
+	if err != nil || len(books) == 0 {
+		return fmt.Errorf("读取最优盘口: %w", err)
+	}
+	bid, _ := strconv.ParseFloat(books[0].BidPrice, 64)
+	ask, _ := strconv.ParseFloat(books[0].AskPrice, 64)
+	basePrice, orderSide := bid, binance.SideTypeBuy
+	positionSide := binance.PositionSideTypeLong
+	sideCode := "L"
+	if side < 0 {
+		basePrice, orderSide = ask, binance.SideTypeSell
+		positionSide, sideCode = binance.PositionSideTypeShort, "S"
+	}
+	// step.2 使用方向专属 ID 提交最多五档限价单并记录订单状态。
+	// 调用订单前缀辅助函数按交易对生成本策略订单命名空间。
+	prefix := help_orderPrefix(cfg.Symbol) + "E" + sideCode
+	for level := 0; level < 5; level++ {
+		price := basePrice - float64(level)*priceTick*float64(side)
+		// 调用价格格式化辅助函数将限价调整到合法 tick 档位。
+		priceText := help_formatPrice(price, priceTick)
+		clientID := fmt.Sprintf("%s%d", prefix, time.Now().UnixMilli())
+		response, createErr := client.NewCreateOrderService().Symbol(cfg.Symbol).
+			Side(orderSide).PositionSide(positionSide).Type(binance.OrderTypeLimit).
+			TimeInForce(binance.TimeInForceTypeGTC).Quantity(quantity).Price(priceText).
+			NewClientOrderID(clientID).Do(ctx)
+		if createErr == nil {
+			state.entryOrderID, state.entryAt = response.ClientOrderID, time.Now()
+			strategy.turns = 0
+			log.Printf("%s 开仓限价单已提交: id=%s qty=%s price=%s",
+				positionSide, response.ClientOrderID, quantity, priceText)
+			return nil
+		}
+		if level == 4 {
+			return fmt.Errorf("连续五档 %s GTC 开仓单均失败: %w", positionSide, createErr)
+		}
+	}
+	return nil
+}
+
+// 为指定双向持仓提交 positionSide 隔离的止盈和止损条件单。
+func help_placeProtectionSide(ctx context.Context, client *binance.Client, cfg config,
+	entryOrderID string, positionSide binance.PositionSideType,
+	position, entryPrice, priceTick float64, hasTakeProfit, hasStopLoss bool) error {
+	// step.1 根据持仓方向计算触发价与平仓订单方向。
+	closeSide := binance.SideTypeSell
+	takePrice, stopPrice := entryPrice*(1+cfg.TakeProfit), entryPrice*(1-cfg.StopLoss)
+	if positionSide == binance.PositionSideTypeShort {
+		closeSide = binance.SideTypeBuy
+		takePrice, stopPrice = entryPrice*(1-cfg.TakeProfit), entryPrice*(1+cfg.StopLoss)
+	}
+	sideCode := "L"
+	if positionSide == binance.PositionSideTypeShort {
+		sideCode = "S"
+	}
+	// 调用订单前缀辅助函数按交易对生成本策略订单命名空间。
+	orderPrefix := help_orderPrefix(cfg.Symbol)
+	stamp := fmt.Sprintf("%012d", time.Now().UnixMilli()%1_000_000_000_000)
+	prefix := orderPrefix + "X" + sideCode + stamp
+	// step.2 提交绑定该持仓方向的全仓止盈止损条件单。
+	if !hasTakeProfit {
+		// 调用价格格式化辅助函数将止盈触发价调整到合法 tick 档位。
+		trigger := help_formatPrice(takePrice, priceTick)
+		_, err := client.NewCreateAlgoOrderService().Symbol(cfg.Symbol).Side(closeSide).
+			PositionSide(positionSide).Type(binance.AlgoOrderTypeTakeProfitMarket).
+			ClosePosition(true).WorkingType(binance.WorkingTypeMarkPrice).
+			TriggerPrice(trigger).ClientAlgoId(prefix + "T").Do(ctx)
+		if err != nil {
+			return fmt.Errorf("创建%s止盈条件单: %w", positionSide, err)
+		}
+	}
+	if !hasStopLoss {
+		// 调用价格格式化辅助函数将止损触发价调整到合法 tick 档位。
+		trigger := help_formatPrice(stopPrice, priceTick)
+		_, err := client.NewCreateAlgoOrderService().Symbol(cfg.Symbol).Side(closeSide).
+			PositionSide(positionSide).Type(binance.AlgoOrderTypeStopMarket).
+			ClosePosition(true).WorkingType(binance.WorkingTypeMarkPrice).
+			TriggerPrice(trigger).ClientAlgoId(prefix + "S").Do(ctx)
+		if err != nil {
+			return fmt.Errorf("创建%s止损条件单: %w", positionSide, err)
+		}
+	}
+	log.Printf("%s 持仓保护已设置: 来源开仓单=%s take=%g stop=%g",
+		positionSide, entryOrderID, takePrice, stopPrice)
 	return nil
 }
 
