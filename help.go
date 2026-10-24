@@ -30,19 +30,23 @@ type config struct {
 
 // 保存 EMA 信号计算状态和本进程创建的开仓单标识。
 type strategyState struct {
-	mu            sync.Mutex
-	ema           float64
-	emaReady      bool
-	previousDelta float64
-	deltaReady    bool
-	side          int
-	turns         int
-	longEntryID   string
-	longEntryAt   time.Time
-	shortEntryID  string
-	shortEntryAt  time.Time
-	entryOrderID  string
-	entryAt       time.Time
+	mu                sync.Mutex
+	ema               float64
+	emaReady          bool
+	previousDelta     float64
+	deltaReady        bool
+	side              int
+	turns             int
+	longEntryID       string
+	longEntryAt       time.Time
+	longEntryFilled   bool
+	longPositionSeen  bool
+	shortEntryID      string
+	shortEntryAt      time.Time
+	shortEntryFilled  bool
+	shortPositionSeen bool
+	entryOrderID      string
+	entryAt           time.Time
 }
 
 // 保存单一持仓方向的开仓挂单标识和提交时间。
@@ -487,8 +491,14 @@ func help_processCandleDual(ctx context.Context, client *binance.Client, cfg con
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	long := &positionState{entryOrderID: state.longEntryID, entryAt: state.longEntryAt}
-	short := &positionState{entryOrderID: state.shortEntryID, entryAt: state.shortEntryAt}
+	long := &positionState{
+		entryOrderID: state.longEntryID, entryAt: state.longEntryAt,
+		entryFilled: state.longEntryFilled, positionSeen: state.longPositionSeen,
+	}
+	short := &positionState{
+		entryOrderID: state.shortEntryID, entryAt: state.shortEntryAt,
+		entryFilled: state.shortEntryFilled, positionSeen: state.shortPositionSeen,
+	}
 	// 调用方向管理辅助函数维护本策略 LONG 仓位和订单。
 	if err := help_managePositionSide(ctx, client, cfg, positions, orders,
 		algos, binance.PositionSideTypeLong, long, priceTick); err != nil {
@@ -501,10 +511,17 @@ func help_processCandleDual(ctx context.Context, client *binance.Client, cfg con
 	}
 	state.longEntryID, state.longEntryAt = long.entryOrderID, long.entryAt
 	state.shortEntryID, state.shortEntryAt = short.entryOrderID, short.entryAt
+	state.longEntryFilled, state.longPositionSeen = long.entryFilled, long.positionSeen
+	state.shortEntryFilled, state.shortPositionSeen = short.entryFilled, short.positionSeen
 	// step.2 更新 EMA 入场信号，并只在目标方向没有仓位或挂单时开仓。
 	if !state.emaReady {
 		state.ema = closePrice
 		state.emaReady = true
+		log.Printf("周期状态: symbol=%s LONG仓位/挂单=%s SHORT仓位/挂单=%s EMA初始化中 close=%.8f",
+			cfg.Symbol, help_positionStatus(positions, orders, cfg.Symbol,
+				binance.PositionSideTypeLong, long.entryOrderID),
+			help_positionStatus(positions, orders, cfg.Symbol,
+				binance.PositionSideTypeShort, short.entryOrderID), closePrice)
 		return nil
 	}
 	previous := state.ema
@@ -527,7 +544,19 @@ func help_processCandleDual(ctx context.Context, client *binance.Client, cfg con
 	if signal != state.side {
 		state.side, state.turns = signal, 0
 	}
+	longStatus := help_positionStatus(positions, orders, cfg.Symbol,
+		binance.PositionSideTypeLong, long.entryOrderID)
+	shortStatus := help_positionStatus(positions, orders, cfg.Symbol,
+		binance.PositionSideTypeShort, short.entryOrderID)
+	signalName := "持平"
+	if signal > 0 {
+		signalName = "EMA向上"
+	} else if signal < 0 {
+		signalName = "EMA向下"
+	}
 	if signal == 0 || state.turns < 2 {
+		log.Printf("周期状态: symbol=%s LONG仓位/挂单=%s SHORT仓位/挂单=%s close=%.8f EMA=%.8f signal=%s turns=%d/2 不开仓",
+			cfg.Symbol, longStatus, shortStatus, closePrice, state.ema, signalName, state.turns)
 		return nil
 	}
 	entrySide := -signal
@@ -536,16 +565,61 @@ func help_processCandleDual(ctx context.Context, client *binance.Client, cfg con
 		target = short
 	}
 	if target.entryOrderID != "" {
+		log.Printf("周期状态: symbol=%s LONG仓位/挂单=%s SHORT仓位/挂单=%s close=%.8f EMA=%.8f signal=%s turns=%d/2 目标方向已有挂单，不开新单",
+			cfg.Symbol, longStatus, shortStatus, closePrice, state.ema, signalName, state.turns)
 		return nil
 	}
 	// 调用方向开仓辅助函数创建目标持仓侧的唯一 GTC 挂单。
 	if err := help_placeEntrySide(ctx, client, cfg, state, target, entrySide,
 		priceTick, quantity); err != nil {
+		log.Printf("周期状态: symbol=%s LONG仓位/挂单=%s SHORT仓位/挂单=%s close=%.8f EMA=%.8f signal=%s 开仓提交失败: %v",
+			cfg.Symbol, longStatus, shortStatus, closePrice, state.ema, signalName, err)
 		return err
 	}
 	state.longEntryID, state.longEntryAt = long.entryOrderID, long.entryAt
 	state.shortEntryID, state.shortEntryAt = short.entryOrderID, short.entryAt
+	state.longEntryFilled, state.longPositionSeen = long.entryFilled, long.positionSeen
+	state.shortEntryFilled, state.shortPositionSeen = short.entryFilled, short.positionSeen
+	// 调用状态汇总辅助函数反映本周期刚提交的 LONG 开仓挂单。
+	longStatus = help_positionStatus(positions, orders, cfg.Symbol,
+		binance.PositionSideTypeLong, long.entryOrderID)
+	// 调用状态汇总辅助函数反映本周期刚提交的 SHORT 开仓挂单。
+	shortStatus = help_positionStatus(positions, orders, cfg.Symbol,
+		binance.PositionSideTypeShort, short.entryOrderID)
+	log.Printf("周期状态: symbol=%s LONG仓位/挂单=%s SHORT仓位/挂单=%s close=%.8f EMA=%.8f signal=%s turns=%d/2",
+		cfg.Symbol, longStatus, shortStatus, closePrice, state.ema, signalName, state.turns)
 	return nil
+}
+
+// 汇总指定持仓方向的当前仓位和本策略开仓挂单状态。
+func help_positionStatus(positions []*binance.PositionRisk, orders []*binance.Order,
+	symbol string, positionSide binance.PositionSideType, entryOrderID string) string {
+	// step.1 查询交易所返回的指定方向仓位数量。
+	amount := "0"
+	for _, position := range positions {
+		if position.Symbol == symbol && position.PositionSide == string(positionSide) {
+			amount = position.PositionAmt
+			break
+		}
+	}
+	if amount != "0" && amount != "0.0" {
+		parsedAmount, _ := strconv.ParseFloat(amount, 64)
+		if parsedAmount != 0 {
+			return "持仓=" + amount
+		}
+	}
+	if entryOrderID != "" {
+		return "空仓,开仓挂单=" + entryOrderID
+	}
+	// step.2 根据本策略订单前缀识别仍在交易所挂着的开仓单。
+	for _, order := range orders {
+		if order.PositionSide == positionSide && strings.HasPrefix(order.ClientOrderID,
+			// 调用订单前缀辅助函数限定为当前交易对的本策略开仓单。
+			help_orderPrefix(symbol)+"E") {
+			return "空仓,开仓挂单=" + order.ClientOrderID
+		}
+	}
+	return "空仓,无开仓挂单"
 }
 
 // 仅维护指定持仓方向的仓位保护单和对应开仓挂单。
