@@ -1,0 +1,16 @@
+{
+  "keyfile": "/root/key",
+  "kline_count": 12,
+  "trade_mode": 3,
+  "trade_usdt": 100,
+  "trade_interval_seconds": 20,
+  "entry_reprice_seconds": 1.5,
+  "min_trade_interval_mins": 3600,
+  "max_symbols": 2,
+  "take_profit_rate": 0.03,
+  "stop_loss_rate": 0.1,
+  "min_move_rate": 0.3,
+  "leverage": 1,
+  "state_file": "data/state.json",
+  "stale_price_seconds": 30
+}

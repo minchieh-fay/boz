@@ -3,11 +3,12 @@ services:
     image: alpine:3.22
     platform: linux/amd64
     working_dir: /app
-    command: ["/app/boz", "/app/config.json"]
+    command: ["/app/boz-linux-amd64", "-config", "/app/config.json"]
     init: true
     restart: unless-stopped
+    stop_grace_period: 45s
     volumes:
-      - ./boz:/app/boz:ro
+      - ./boz-linux-amd64:/app/boz-linux-amd64:ro
       - ./config.json:/app/config.json:ro
       - /root/key:/root/key:ro
-      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - ./data:/app/data

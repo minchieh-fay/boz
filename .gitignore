@@ -36,3 +36,12 @@ go.work.sum
 [0-9].md
 [0-9].txt
 boz
+# 策略运行时产物
+.state/
+
+# 本地凭证及跨平台构建产物
+key
+boz-linux-*
+
+# 实盘持久化账本和锁文件
+data/
