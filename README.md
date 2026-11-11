@@ -65,7 +65,6 @@ Go + `github.com/adshao/go-binance/v2/futures` 实现 Binance USDT 永续合约�
 {
   "keyfile": "/root/key",
   "kline_count": 12,
-  "trade_mode": 3,
   "trade_usdt": 100,
   "trade_interval_seconds": 20,
   "entry_reprice_seconds": 1.5,
@@ -84,7 +83,6 @@ Go + `github.com/adshao/go-binance/v2/futures` 实现 Binance USDT 永续合约�
 | --- | --- |
 | `keyfile` | API key、secret 各一行；相对路径以配置文件目录为基准 |
 | `kline_count` | 固定窗口根数，1～1500，包含当前 K 线 |
-| `trade_mode` | 固定 3，表示双向；其他值拒绝启动 |
 | `trade_usdt` | 每个方向的目标名义金额，按数量步进向下取整 |
 | `trade_interval_seconds` | 选币扫描周期，默认 20 秒 |
 | `entry_reprice_seconds` | 撤单重挂维护周期，默认 1.5 秒，最少 0.1 秒 |

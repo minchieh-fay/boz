@@ -1,7 +1,6 @@
 {
   "keyfile": "/root/key",
   "kline_count": 12,
-  "trade_mode": 3,
   "trade_usdt": 100,
   "trade_interval_seconds": 20,
   "entry_reprice_seconds": 1.5,
