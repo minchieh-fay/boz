@@ -125,7 +125,12 @@ func (e *Exchange) recordPlanStatistics(ctx context.Context, p *Plan) error {
 	if p.StartedAt > 0 {
 		service.StartTime(p.StartedAt)
 	} else {
-		log.Printf("交易统计 symbol=%s 使用旧计划的近期成交记录，started_at 缺失", p.Symbol)
+		stats := &e.State.Statistics
+		stats.CompletedTrades++
+		stats.LastSymbol, stats.LastTradeAt = p.Symbol, time.Now().UnixMilli()
+		log.Printf("交易完成 symbol=%s total_trades=%d；旧计划缺少 started_at，无法回溯可靠收益",
+			p.Symbol, stats.CompletedTrades)
+		return nil
 	}
 	trades, err := service.Do(ctx)
 	if err != nil {
@@ -152,12 +157,12 @@ func (e *Exchange) recordPlanStatistics(ctx context.Context, p *Plan) error {
 	net := gross.Sub(fees)
 	stats := &e.State.Statistics
 	stats.CompletedTrades++
-	stats.TotalFills += len(trades)
+	stats.FillRecords += len(trades)
 	stats.GrossPnL = stats.GrossPnL.Add(gross)
 	stats.Fees = stats.Fees.Add(fees)
 	stats.NetPnL = stats.NetPnL.Add(net)
 	stats.LastSymbol, stats.LastTradeAt = p.Symbol, time.Now().UnixMilli()
-	log.Printf("交易完成 symbol=%s fills=%d gross_pnl=%s fees=%s net_pnl=%s cumulative_net_pnl=%s total_trades=%d",
+	log.Printf("交易完成 symbol=%s fill_records=%d gross_pnl=%s fees=%s net_pnl=%s cumulative_net_pnl=%s total_trades=%d",
 		p.Symbol, len(trades), gross.StringFixed(8), fees.StringFixed(8), net.StringFixed(8),
 		stats.NetPnL.StringFixed(8), stats.CompletedTrades)
 	return nil

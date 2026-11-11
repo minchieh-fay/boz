@@ -45,7 +45,8 @@ type Plan struct {
 // Statistics 保存策略进程内已完成交易组的粗略收益和手续费统计。
 type Statistics struct {
 	CompletedTrades int             `json:"completed_trades"`
-	TotalFills      int             `json:"total_fills"`
+	FillRecords     int             `json:"fill_records"`
+	LegacyFills     int             `json:"total_fills,omitempty"`
 	GrossPnL        decimal.Decimal `json:"gross_pnl"`
 	Fees            decimal.Decimal `json:"fees"`
 	NetPnL          decimal.Decimal `json:"net_pnl"`
@@ -89,6 +90,14 @@ func loadState(path string) (*State, error) {
 		if p.Emergency && strings.Contains(p.Reason, "context canceled") {
 			p.Halt, p.Emergency, p.Reason = false, false, ""
 		}
+	}
+	// step.4 丢弃旧版本把成交明细误标为 total_fills 的收益统计，保留已完成组数。
+	if s.Statistics.LegacyFills > 0 {
+		s.Statistics.FillRecords = 0
+		s.Statistics.GrossPnL = decimal.Zero
+		s.Statistics.Fees = decimal.Zero
+		s.Statistics.NetPnL = decimal.Zero
+		s.Statistics.LegacyFills = 0
 	}
 	return s, nil
 }

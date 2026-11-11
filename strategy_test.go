@@ -393,6 +393,26 @@ func TestLegacyEmergencyStateMigrates(t *testing.T) {
 	}
 }
 
+// TestLegacyStatisticsMigrates 验证旧版 total_fills 统计不会继续冒充当前总交易次数和收益。
+func TestLegacyStatisticsMigrates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := &State{Version: 1, Plans: map[string]*Plan{}, Cooldowns: map[string]int64{},
+		Occupied: map[string]bool{}, Statistics: Statistics{CompletedTrades: 2, LegacyFills: 429,
+			GrossPnL: decimal.NewFromFloat(70.56), Fees: decimal.NewFromFloat(5.69), NetPnL: decimal.NewFromFloat(64.87)}}
+	if err := legacy.save(path); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Statistics.CompletedTrades != 2 || restored.Statistics.LegacyFills != 0 ||
+		!restored.Statistics.GrossPnL.IsZero() || !restored.Statistics.Fees.IsZero() ||
+		!restored.Statistics.NetPnL.IsZero() {
+		t.Fatalf("旧统计未清理: %+v", restored.Statistics)
+	}
+}
+
 // TestRejectedProtectionRequestsExit 验证保护明确拒绝后停止新增开仓并进入紧急退出状态。
 func TestRejectedProtectionRequestsExit(t *testing.T) {
 	// 调用本目录辅助函数，模拟条件单已经越过触发价而被拒绝。
@@ -537,7 +557,7 @@ func TestRestartToFullLifecycle(t *testing.T) {
 	if len(restored.Plans) != 0 || restored.Cooldowns["TESTUSDT"] == 0 {
 		t.Fatal("退出后未释放计划或记录冷却")
 	}
-	if restored.Statistics.CompletedTrades != 1 || restored.Statistics.TotalFills != 2 ||
+	if restored.Statistics.CompletedTrades != 1 || restored.Statistics.FillRecords != 2 ||
 		!restored.Statistics.GrossPnL.Equal(decimal.NewFromInt(1)) ||
 		!restored.Statistics.Fees.Equal(decimal.RequireFromString("0.072")) ||
 		!restored.Statistics.NetPnL.Equal(decimal.RequireFromString("0.928")) {
