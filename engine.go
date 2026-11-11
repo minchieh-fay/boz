@@ -35,6 +35,9 @@ func (e *Exchange) maintainPlan(ctx context.Context, p *Plan) error {
 		if !p.Emergency {
 			if err = e.protect(ctx, p, l, position); err != nil {
 				cycleErrors = append(cycleErrors, err)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					continue
+				}
 				p.Halt, p.Emergency, p.Reason = true, true, "保护无法确认，停止开仓并请求退出: "+err.Error()
 				if saveErr := e.persist(); saveErr != nil {
 					return saveErr
@@ -118,11 +121,13 @@ func (e *Exchange) finishPlan(ctx context.Context, p *Plan) error {
 // recordPlanStatistics 按本组开始时间读取账户成交，使用 Binance 已实现盈亏并按 0.04% 估算手续费。
 func (e *Exchange) recordPlanStatistics(ctx context.Context, p *Plan) error {
 	// step.1 读取本组交易对在开仓后的全部账户成交，统计成交笔数、已实现盈亏和成交额。
-	if p.StartedAt <= 0 {
-		return fmt.Errorf("%s 缺少计划开始时间，拒绝生成不可靠的收益统计", p.Symbol)
+	service := e.Client.NewListAccountTradeService().Symbol(p.Symbol).EndTime(time.Now().UnixMilli()).Limit(1000)
+	if p.StartedAt > 0 {
+		service.StartTime(p.StartedAt)
+	} else {
+		log.Printf("交易统计 symbol=%s 使用旧计划的近期成交记录，started_at 缺失", p.Symbol)
 	}
-	trades, err := e.Client.NewListAccountTradeService().Symbol(p.Symbol).
-		StartTime(p.StartedAt).EndTime(time.Now().UnixMilli()).Limit(1000).Do(ctx)
+	trades, err := service.Do(ctx)
 	if err != nil {
 		return fmt.Errorf("读取 %s 成交记录: %w", p.Symbol, err)
 	}

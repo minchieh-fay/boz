@@ -373,6 +373,26 @@ func TestCorruptStateFailsClosed(t *testing.T) {
 	}
 }
 
+// TestLegacyEmergencyStateMigrates 验证旧账本中的上下文取消状态不会在重启后持续紧急退出。
+func TestLegacyEmergencyStateMigrates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := &State{Version: 1, Plans: map[string]*Plan{
+		"TESTUSDT": {Symbol: "TESTUSDT", Target: decimal.NewFromInt(1), Halt: true, Emergency: true,
+			Reason: "保护无法确认: context canceled", Legs: []*Leg{{Direction: "LONG"}, {Direction: "SHORT"}}},
+	}, Cooldowns: map[string]int64{}, Occupied: map[string]bool{}}
+	if err := legacy.save(path); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := restored.Plans["TESTUSDT"]
+	if p.Halt || p.Emergency || p.Reason != "" {
+		t.Fatalf("旧紧急状态未迁移: %+v", p)
+	}
+}
+
 // TestRejectedProtectionRequestsExit 验证保护明确拒绝后停止新增开仓并进入紧急退出状态。
 func TestRejectedProtectionRequestsExit(t *testing.T) {
 	// 调用本目录辅助函数，模拟条件单已经越过触发价而被拒绝。

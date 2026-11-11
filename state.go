@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -83,6 +84,10 @@ func loadState(path string) (*State, error) {
 		if p == nil || p.Symbol != symbol || !p.Target.IsPositive() || len(p.Legs) != 2 ||
 			p.Legs[0] == nil || p.Legs[1] == nil || p.Legs[0].Direction != "LONG" || p.Legs[1].Direction != "SHORT" {
 			return nil, fmt.Errorf("%s 双向计划损坏", symbol)
+		}
+		// step.3 兼容旧版本把 context canceled 持久化成紧急状态的计划。
+		if p.Emergency && strings.Contains(p.Reason, "context canceled") {
+			p.Halt, p.Emergency, p.Reason = false, false, ""
 		}
 	}
 	return s, nil
