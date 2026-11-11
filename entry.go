@@ -72,7 +72,7 @@ func (e *Exchange) placeEntry(ctx context.Context, p *Plan, l *Leg) error {
 		return e.persist()
 	}
 	// step.2 每次发送前保存唯一身份；明确 GTX 穿价拒绝才移动一档。
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		// 调用本目录辅助函数，预写入可查询的自有开仓身份。
 		l.Entry = &Intent{ID: help_id("entry"), PlacedAt: time.Now().UnixMilli()}
 		if err = e.persist(); err != nil {
@@ -106,7 +106,7 @@ func (e *Exchange) placeEntry(ctx context.Context, p *Plan, l *Leg) error {
 			return fmt.Errorf("%s 被动价格无效", p.Symbol)
 		}
 	}
-	return fmt.Errorf("%s GTX 连续穿价拒绝，下个维护周期重试", p.Symbol)
+	return fmt.Errorf("%s GTX 连续 3 次穿价拒绝，下个维护周期重试", p.Symbol)
 }
 
 // readEntry 核对原身份并增量记账，仅终态订单才释放开仓身份。

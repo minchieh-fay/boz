@@ -151,6 +151,58 @@ func TestPostOnlyFallback(t *testing.T) {
 	}
 }
 
+// TestPostOnlyThreeRejects 验证连续三次 GTX 穿价拒绝后等待下一个维护周期，不立即继续追价。
+func TestPostOnlyThreeRejects(t *testing.T) {
+	posts := 0
+	e := newTestExchange(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			writeTestJSON(t, w, map[string]string{"symbol": "TESTUSDT", "bidPrice": "100", "askPrice": "100.01"})
+			return
+		}
+		posts++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"code":-5022,"msg":"post only reject"}`))
+	})
+	p := newTestPlan(e)
+	err := e.placeEntry(context.Background(), p, p.Legs[0])
+	if err == nil || posts != 3 || p.Legs[0].Entry != nil {
+		t.Fatalf("GTX 重试次数或身份错误 posts=%d err=%v entry=%+v", posts, err, p.Legs[0].Entry)
+	}
+}
+
+// TestMissingProtectionRecreated 验证保护单返回 -2013 时按仍在的实际仓位重新托管保护。
+func TestMissingProtectionRecreated(t *testing.T) {
+	gets, posts := 0, 0
+	e := newTestExchange(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			gets++
+			if gets == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"code":-2013,"msg":"Order does not exist"}`))
+				return
+			}
+			writeTestJSON(t, w, map[string]string{"algoStatus": "NEW"})
+		case http.MethodPost:
+			posts++
+			writeTestJSON(t, w, map[string]any{"algoId": 1, "algoStatus": "NEW"})
+		default:
+			writeTestJSON(t, w, map[string]string{"algoStatus": "CANCELED"})
+		}
+	})
+	p := newTestPlan(e)
+	p.Legs[0].StopID = "boz_protect_missing"
+	p.Legs[0].StopPrice = "90"
+	if err := e.protect(context.Background(), p, p.Legs[0], Position{
+		Quantity: decimal.NewFromInt(1), Entry: decimal.NewFromInt(100),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 2 || gets != 1 || p.Legs[0].StopID == "" {
+		t.Fatalf("保护单未按 -2013 重建 gets=%d posts=%d id=%q", gets, posts, p.Legs[0].StopID)
+	}
+}
+
 // TestUnknownEntryNeverResubmits 验证执行未知和查询未找到都不会产生第二笔开仓。
 func TestUnknownEntryNeverResubmits(t *testing.T) {
 	// step.1 模拟交易所执行未知，随后查询返回订单未找到。

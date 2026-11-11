@@ -41,31 +41,41 @@ func (e *Exchange) syncProtection(
 	if *id != "" {
 		order, err := e.Client.NewGetAlgoOrderService().ClientAlgoID(*id).Do(ctx)
 		if err != nil {
-			return fmt.Errorf("保护单 %s 回报未确认: %w", *id, err)
+			// step.1.1 条件单已不存在时先清除旧身份，后续按仍在的实际仓位重建保护。
+			if help_code(err, -2013) {
+				*id, *savedPrice = "", ""
+				if saveErr := e.persist(); saveErr != nil {
+					return saveErr
+				}
+			} else {
+				return fmt.Errorf("保护单 %s 回报未确认: %w", *id, err)
+			}
 		}
-		switch string(order.AlgoStatus) {
-		case "NEW":
-			if *savedPrice == price {
-				return nil
-			}
-			if err = e.cancelProtection(ctx, *id); err != nil {
-				return err
-			}
-			order, err = e.Client.NewGetAlgoOrderService().ClientAlgoID(*id).Do(ctx)
-			if err != nil {
-				return err
-			}
-			if string(order.AlgoStatus) != "CANCELED" && string(order.AlgoStatus) != "EXPIRED" {
+		if order != nil {
+			switch string(order.AlgoStatus) {
+			case "NEW":
+				if *savedPrice == price {
+					return nil
+				}
+				if err = e.cancelProtection(ctx, *id); err != nil {
+					return err
+				}
+				order, err = e.Client.NewGetAlgoOrderService().ClientAlgoID(*id).Do(ctx)
+				if err != nil {
+					return err
+				}
+				if string(order.AlgoStatus) != "CANCELED" && string(order.AlgoStatus) != "EXPIRED" {
+					return e.observeTriggered(ctx, p, order)
+				}
+			case "CANCELED", "EXPIRED":
+				// 人工取消或过期后，只为仍然存在的持仓重建保护。
+			default:
 				return e.observeTriggered(ctx, p, order)
 			}
-		case "CANCELED", "EXPIRED":
-			// 人工取消或过期后，只为仍然存在的持仓重建保护。
-		default:
-			return e.observeTriggered(ctx, p, order)
-		}
-		*id = ""
-		if err := e.persist(); err != nil {
-			return err
+			*id = ""
+			if err := e.persist(); err != nil {
+				return err
+			}
 		}
 	}
 	// step.2 发送前持久化自定义身份，使用 closePosition 覆盖整个方向而非固定数量。
@@ -128,6 +138,9 @@ func (e *Exchange) cancelProtection(ctx context.Context, id string) error {
 	}
 	order, err := e.Client.NewGetAlgoOrderService().ClientAlgoID(id).Do(ctx)
 	if err != nil {
+		if help_code(err, -2013) {
+			return nil
+		}
 		return err
 	}
 	if string(order.AlgoStatus) != "NEW" {
@@ -137,6 +150,9 @@ func (e *Exchange) cancelProtection(ctx context.Context, id string) error {
 	_, cancelErr := e.Client.NewCancelAlgoOrderService().ClientAlgoID(id).Do(ctx)
 	order, err = e.Client.NewGetAlgoOrderService().ClientAlgoID(id).Do(ctx)
 	if err != nil {
+		if help_code(err, -2013) {
+			return nil
+		}
 		return err
 	}
 	if string(order.AlgoStatus) == "NEW" {
