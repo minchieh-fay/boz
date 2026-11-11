@@ -31,7 +31,8 @@ func (e *Exchange) startPlan(ctx context.Context, symbol string) error {
 		return err
 	}
 	// step.2 下单前先持久化目标，重启后延续同一组开仓义务。
-	p := &Plan{Symbol: symbol, Target: target, Legs: []*Leg{{Direction: "LONG"}, {Direction: "SHORT"}}}
+	p := &Plan{Symbol: symbol, StartedAt: time.Now().UnixMilli(), Target: target,
+		Legs: []*Leg{{Direction: "LONG"}, {Direction: "SHORT"}}}
 	e.State.Plans[symbol] = p
 	if err = e.persist(); err != nil {
 		return err

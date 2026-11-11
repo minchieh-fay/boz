@@ -33,6 +33,7 @@ type Leg struct {
 // Plan 保存同币双向等量开仓目标，已退出的成交不会重新补开。
 type Plan struct {
 	Symbol    string          `json:"symbol"`
+	StartedAt int64           `json:"started_at"`
 	Target    decimal.Decimal `json:"target"`
 	Legs      []*Leg          `json:"legs"`
 	Halt      bool            `json:"halt"`
@@ -40,12 +41,24 @@ type Plan struct {
 	Reason    string          `json:"reason,omitempty"`
 }
 
+// Statistics 保存策略进程内已完成交易组的粗略收益和手续费统计。
+type Statistics struct {
+	CompletedTrades int             `json:"completed_trades"`
+	TotalFills      int             `json:"total_fills"`
+	GrossPnL        decimal.Decimal `json:"gross_pnl"`
+	Fees            decimal.Decimal `json:"fees"`
+	NetPnL          decimal.Decimal `json:"net_pnl"`
+	LastSymbol      string          `json:"last_symbol,omitempty"`
+	LastTradeAt     int64           `json:"last_trade_at,omitempty"`
+}
+
 // State 保存活跃计划、全账户占用记录及已完全平仓交易对的冷却起点。
 type State struct {
-	Version   int              `json:"version"`
-	Plans     map[string]*Plan `json:"plans"`
-	Cooldowns map[string]int64 `json:"cooldowns"`
-	Occupied  map[string]bool  `json:"occupied"`
+	Version    int              `json:"version"`
+	Plans      map[string]*Plan `json:"plans"`
+	Cooldowns  map[string]int64 `json:"cooldowns"`
+	Occupied   map[string]bool  `json:"occupied"`
+	Statistics Statistics       `json:"statistics"`
 }
 
 // loadState 恢复账本，拒绝用空账本覆盖损坏或不兼容的状态。

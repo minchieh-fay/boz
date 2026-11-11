@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // maintainPlan 核对双边成交，保护部分持仓，并在没有退出事件时补齐共同目标。
@@ -101,12 +103,59 @@ func (e *Exchange) finishPlan(ctx context.Context, p *Plan) error {
 	if a.Occupied[p.Symbol] {
 		return nil
 	}
-	// step.3 完成时间持久化，重启之后也继续执行冷却。
+	// step.3 查询本组期间的成交，计算毛收益、固定手续费和累计净收益。
+	if err = e.recordPlanStatistics(ctx, p); err != nil {
+		return err
+	}
+	// step.4 完成时间持久化，重启之后也继续执行冷却。
 	e.State.Cooldowns[p.Symbol] = time.Now().UnixMilli()
 	delete(e.State.Plans, p.Symbol)
 	delete(e.State.Occupied, p.Symbol)
 	log.Printf("本组完全结束 symbol=%s cooldown_seconds=%.3f", p.Symbol, e.Config.CooldownSeconds)
 	return e.persist()
+}
+
+// recordPlanStatistics 按本组开始时间读取账户成交，使用 Binance 已实现盈亏并按 0.04% 估算手续费。
+func (e *Exchange) recordPlanStatistics(ctx context.Context, p *Plan) error {
+	// step.1 读取本组交易对在开仓后的全部账户成交，统计成交笔数、已实现盈亏和成交额。
+	if p.StartedAt <= 0 {
+		return fmt.Errorf("%s 缺少计划开始时间，拒绝生成不可靠的收益统计", p.Symbol)
+	}
+	trades, err := e.Client.NewListAccountTradeService().Symbol(p.Symbol).
+		StartTime(p.StartedAt).EndTime(time.Now().UnixMilli()).Limit(1000).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("读取 %s 成交记录: %w", p.Symbol, err)
+	}
+	gross, turnover := decimal.Zero, decimal.Zero
+	for _, trade := range trades {
+		if trade == nil {
+			continue
+		}
+		pnl, parseErr := help_decimal(trade.RealizedPnl)
+		if parseErr != nil {
+			return fmt.Errorf("解析 %s 已实现盈亏: %w", p.Symbol, parseErr)
+		}
+		quote, parseErr := help_decimal(trade.QuoteQuantity)
+		if parseErr != nil {
+			return fmt.Errorf("解析 %s 成交额: %w", p.Symbol, parseErr)
+		}
+		gross = gross.Add(pnl)
+		turnover = turnover.Add(quote.Abs())
+	}
+	// step.2 按开仓和平仓全部成交额收取 0.04%，并把本组结果合并进持久化总账。
+	fees := turnover.Mul(decimal.NewFromFloat(0.0004))
+	net := gross.Sub(fees)
+	stats := &e.State.Statistics
+	stats.CompletedTrades++
+	stats.TotalFills += len(trades)
+	stats.GrossPnL = stats.GrossPnL.Add(gross)
+	stats.Fees = stats.Fees.Add(fees)
+	stats.NetPnL = stats.NetPnL.Add(net)
+	stats.LastSymbol, stats.LastTradeAt = p.Symbol, time.Now().UnixMilli()
+	log.Printf("交易完成 symbol=%s fills=%d gross_pnl=%s fees=%s net_pnl=%s cumulative_net_pnl=%s total_trades=%d",
+		p.Symbol, len(trades), gross.StringFixed(8), fees.StringFixed(8), net.StringFixed(8),
+		stats.NetPnL.StringFixed(8), stats.CompletedTrades)
+	return nil
 }
 
 // scan 在完整账户快照基础上先维护冷却，再按振幅创建不冲突的新计划。

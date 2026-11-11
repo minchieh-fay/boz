@@ -465,6 +465,11 @@ func TestRestartToFullLifecycle(t *testing.T) {
 			writeTestJSON(t, w, algos[id])
 		case "/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders":
 			w.Write([]byte(`[]`))
+		case "/fapi/v1/userTrades":
+			writeTestJSON(t, w, []map[string]any{
+				{"id": 1, "qty": "0.9", "quoteQty": "90", "realizedPnl": "0"},
+				{"id": 2, "qty": "0.9", "quoteQty": "90", "realizedPnl": "1"},
+			})
 		default:
 			t.Errorf("意外路径 %s", r.URL.Path)
 			w.WriteHeader(500)
@@ -511,6 +516,12 @@ func TestRestartToFullLifecycle(t *testing.T) {
 	}
 	if len(restored.Plans) != 0 || restored.Cooldowns["TESTUSDT"] == 0 {
 		t.Fatal("退出后未释放计划或记录冷却")
+	}
+	if restored.Statistics.CompletedTrades != 1 || restored.Statistics.TotalFills != 2 ||
+		!restored.Statistics.GrossPnL.Equal(decimal.NewFromInt(1)) ||
+		!restored.Statistics.Fees.Equal(decimal.RequireFromString("0.072")) ||
+		!restored.Statistics.NetPnL.Equal(decimal.RequireFromString("0.928")) {
+		t.Fatalf("收益统计错误: %+v", restored.Statistics)
 	}
 	for _, order := range algos {
 		if order["algoStatus"] != "CANCELED" {

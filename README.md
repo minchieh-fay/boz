@@ -14,6 +14,8 @@ Go + `github.com/adshao/go-binance/v2/futures` 实现 Binance USDT 永续合约�
 8. 发现部分或全部持仓就按实际成本设置全量 `STOP_MARKET`、`TAKE_PROFIT_MARKET` 条件单：`closePosition=true`，不带固定数量和 `reduceOnly`。使用 `CONTRACT_PRICE` 触发，`priceProtect=false`。条件单由交易所托管，触发后市价退出，实际成交价可能偏离触发价。
 9. 两边都平仓且所有订单清理完成后记录冷却起点。`max_symbols` 按币计数，同币双向占一个名额；已有仓位、挂单及本地未完成/未知计划都占名额。其他策略或手工交易的占用也计入上限。
 
+10. 交易组完全平仓后，读取该交易对从本组开始时间起的账户成交记录，打印并写入 `state.json`：完成交易组数量、成交笔数、已实现毛盈亏、按成交额 `0.04%` 估算的手续费和扣费后的累计净盈亏。这里的“总交易次数”按一组双向开仓并完全结束计 1 次；`total_fills` 另行记录实际成交笔数。
+
 每边止盈止损独立计算，触发价按 tick 四舍五入：
 
 | 方向 | 止盈 | 止损 |
@@ -22,6 +24,24 @@ Go + `github.com/adshao/go-binance/v2/futures` 实现 Binance USDT 永续合约�
 | SHORT | 实际成本 × (1 - take_profit_rate) | 实际成本 × (1 + stop_loss_rate) |
 
 这些比例是价格变动率，不是保证金收益率。一边止盈后另一边继续持仓，整组收益取决于两边最终退出价、手续费和资金费。
+
+收益统计字段示例：
+
+```json
+{
+  "statistics": {
+    "completed_trades": 1,
+    "total_fills": 4,
+    "gross_pnl": "1.25000000",
+    "fees": "0.16000000",
+    "net_pnl": "1.09000000",
+    "last_symbol": "BTCUSDT",
+    "last_trade_at": 1794378305094
+  }
+}
+```
+
+统计依赖 Binance 成交接口返回的 `realizedPnl` 和成交额；资金费、账户其他程序产生的成交、手续费折扣及实际手续费差异不纳入精确核算。若历史计划没有 `started_at`，程序会拒绝生成不可靠的统计并保留计划，避免写入错误收益。
 
 ## 开仓及异常处理
 
